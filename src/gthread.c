@@ -23,6 +23,19 @@ static int gt_next_id = 1;
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 
+void gt_yield(void){
+    gt_thread_t *t = gt_current;
+    t->state = GT_READY;
+    swapcontext(&t->ctx, &gt_sched_ctx);
+}
+
+
+static void gt_destroy(gt_thread_t *t) {
+    free(t->stack);
+    free(t);
+}
+
+
 static void gt_ready_push(gt_thread_t *t){
     t->next = NULL;
     if (gt_ready_tail){
@@ -50,14 +63,19 @@ void gt_run(void){
     gt_thread_t *t;
     while((t = gt_ready_pop()) != NULL){
         gt_current = t;
+        t->state = GT_RUNNING;
         swapcontext(&gt_sched_ctx, &t->ctx);
-        gt_free(t);
+
+        if(t->state == GT_FINISHED){
+            gt_destroy(t);
+        } else {
+            gt_ready_push(t);
+        }
     }
 }
 
 static void gt_trampoline(void){
     gt_thread_t *self = gt_current;
-    self->state = GT_RUNNING;
     self->fn(self->arg); // uradi posao niti
     self->state = GT_FINISHED;
     // funkcija se vraca pa nas uc_link vraca u pozivaoca
@@ -88,18 +106,4 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
 
     gt_ready_push(t);
     return t;
-}
-
-void gt_resume(gt_thread_t *t){
-    if(t->state == GT_FINISHED){
-        return;
-    }
-
-    gt_current = t;
-    swapcontext(&gt_sched_ctx, &t->ctx); // udji u nit i vrati se kad zavrsi
-}
-
-void gt_free(gt_thread_t *t) {
-    free(t->stack);
-    free(t);
 }

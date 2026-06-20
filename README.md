@@ -11,7 +11,7 @@ timer-based preemption. Built and tested on Linux.
 - [x] Project scaffold
 - [x] Context switch
 - [x] Thread control block + spawn
-- [ ] Cooperative scheduler (yield)
+- [x] Cooperative scheduler (yield)
 - [ ] Thread lifecycle (join, cleanup)
 - [ ] Preemption (timer + signal)
 - [ ] Mutex
