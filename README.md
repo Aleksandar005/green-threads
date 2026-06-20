@@ -9,7 +9,7 @@ timer-based preemption. Built and tested on Linux.
 
 ## Roadmap
 - [x] Project scaffold
-- [ ] Context switch
+- [x] Context switch
 - [ ] Thread control block + spawn
 - [ ] Cooperative scheduler (yield)
 - [ ] Thread lifecycle (join, cleanup)
