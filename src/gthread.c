@@ -4,7 +4,7 @@
 
 #define GT_STACK_SIZE (64 * 1024)
 
-enum gt_state {GT_READY, GT_RUNNING, GT_FINISHED};
+enum gt_state {GT_READY, GT_RUNNING, GT_FINISHED, GT_BLOCKED};
 
 struct gt_thread {
     ucontext_t ctx; // sacuvani context
@@ -13,26 +13,44 @@ struct gt_thread {
     void *arg; // argumenti gornje funkcije
     enum gt_state state; // stanje niti
     int id; // redni broj
-    gt_thread_t *next;
+    gt_thread_t *next; // veza u redu spremnih
+    gt_thread_t *joiner; // nit koja ceka da ova zavrsi
+    gt_thread_t *all_next; // veza u listi svih niti
 };
 
-static ucontext_t gt_sched_ctx; // context pozivaoca (npr. main-a)
-static gt_thread_t *gt_current; // nit koja trenutno radi
+static ucontext_t  gt_sched_ctx;
+static gt_thread_t *gt_current;
 static int gt_next_id = 1;
 
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
+static gt_thread_t *gt_all_head;
 
-void gt_yield(void){
-    gt_thread_t *t = gt_current;
-    t->state = GT_READY;
-    swapcontext(&t->ctx, &gt_sched_ctx);
+void gt_yield(void) {
+    gt_thread_t *self = gt_current;
+    self->state = GT_READY;
+    swapcontext(&self->ctx, &gt_sched_ctx);
 }
 
+void gt_join(gt_thread_t *t) {
+    if (t->state == GT_FINISHED){
+        return;
+    }
+    gt_thread_t *self = gt_current;
+    t->joiner = self;
+    self->state = GT_BLOCKED;
+    swapcontext(&self->ctx, &gt_sched_ctx);
+}
 
-static void gt_destroy(gt_thread_t *t) {
-    free(t->stack);
-    free(t);
+static void gt_free_all(void) {
+    gt_thread_t *t = gt_all_head;
+    while (t) {
+        gt_thread_t *next = t->all_next;
+        free(t->stack);
+        free(t);
+        t = next;
+    }
+    gt_all_head = NULL;
 }
 
 
@@ -52,7 +70,7 @@ static gt_thread_t *gt_ready_pop(void){
     if(t){
         gt_ready_head = t->next;
         if(!gt_ready_head){
-            gt_ready_head = NULL;
+            gt_ready_tail = NULL;
         }
     }
 
@@ -66,20 +84,23 @@ void gt_run(void){
         t->state = GT_RUNNING;
         swapcontext(&gt_sched_ctx, &t->ctx);
 
-        if(t->state == GT_FINISHED){
-            gt_destroy(t);
-        } else {
+        if(t->state == GT_READY){
             gt_ready_push(t);
+        } else if(t->state == GT_FINISHED && t->joiner){
+            t->joiner->state = GT_READY;
+            gt_ready_push(t->joiner);
         }
     }
+
+    gt_free_all();
 }
 
-static void gt_trampoline(void){
+static void gt_trampoline(void) {
     gt_thread_t *self = gt_current;
-    self->fn(self->arg); // uradi posao niti
+    self->fn(self->arg);
     self->state = GT_FINISHED;
-    // funkcija se vraca pa nas uc_link vraca u pozivaoca
 }
+
 
 gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     gt_thread_t *t = malloc(sizeof(*t));
@@ -97,12 +118,16 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->arg = arg;
     t->state = GT_READY;
     t->id = gt_next_id++;
+    t->joiner = NULL;
 
     getcontext(&t->ctx);
     t->ctx.uc_stack.ss_sp = t->stack;
     t->ctx.uc_stack.ss_size = GT_STACK_SIZE;
     t->ctx.uc_link = &gt_sched_ctx; // gde se ide kad nit zavrsi
     makecontext(&t->ctx, gt_trampoline, 0);
+
+    t->all_next = gt_all_head;
+    gt_all_head = t;
 
     gt_ready_push(t);
     return t;
