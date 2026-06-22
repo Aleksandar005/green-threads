@@ -1,8 +1,12 @@
 #include "gthread.h"
 #include <stdlib.h>
 #include <ucontext.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/time.h>
 
 #define GT_STACK_SIZE (64 * 1024)
+#define GT_TIME_SLICE_US  50000
 
 enum gt_state {GT_READY, GT_RUNNING, GT_FINISHED, GT_BLOCKED};
 
@@ -77,7 +81,38 @@ static gt_thread_t *gt_ready_pop(void){
     return t;
 }
 
+static void gt_tick(int sig){
+    (void)sig;
+    ssize_t n = write(STDOUT_FILENO, ".", 1);
+    (void)n;
+}
+
+static void gt_timer_start(void){
+    struct sigaction sa;
+    sa.sa_handler = gt_tick;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, NULL);
+
+    struct itimerval tv;
+    tv.it_value.tv_sec = 0;
+    tv.it_value.tv_usec = GT_TIME_SLICE_US;
+    tv.it_interval.tv_sec = 0;
+    tv.it_interval.tv_usec = GT_TIME_SLICE_US;
+    setitimer(ITIMER_REAL, &tv, NULL);
+}
+
+static void gt_timer_stop(void){
+    struct itimerval tv;
+    tv.it_value.tv_sec     = 0;
+    tv.it_value.tv_usec    = 0;
+    tv.it_interval.tv_sec  = 0;
+    tv.it_interval.tv_usec = 0;
+    setitimer(ITIMER_REAL, &tv, NULL);
+}
+
 void gt_run(void){
+    gt_timer_start();
     gt_thread_t *t;
     while((t = gt_ready_pop()) != NULL){
         gt_current = t;
@@ -92,6 +127,7 @@ void gt_run(void){
         }
     }
 
+    gt_timer_stop();
     gt_free_all();
 }
 
