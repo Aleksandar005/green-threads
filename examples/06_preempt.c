@@ -1,23 +1,26 @@
 #include <stdio.h>
 #include "gthread.h"
 
-static void busy(void *arg) {
-    (void)arg;
-    printf("nit: krecem u dugu petlju, bez ijednog yield-a\n");
-    fflush(stdout);
-
-    for (volatile long i = 0; i < 5000000000L; i++) {
-        // samo trosi procesor, nikada ne pozivam gt_yield
+static void racunar(void *arg) {
+    const char *ime = (const char *)arg;
+    long suma = 0;
+    long prag = 100000000L;
+    for (long i = 1; i <= 600000000L; i++) {
+        suma += i;
+        if (i == prag) {
+            printf("  %s: prosao %ld iteracija\n", ime, i);
+            prag += 100000000L;
+        }
     }
-
-    printf("\nnit: petlja gotova\n");
+    printf("%s: gotova (suma = %ld)\n", ime, suma);
 }
 
 int main(void) {
-    gt_spawn(busy, NULL);
+    gt_spawn(racunar, "A");
+    gt_spawn(racunar, "B");
 
-    printf("main: pustam rasporedjivac (tajmer radi u pozadini)\n");
+    printf("main: dve niti racunaju, NIJEDNA ne poziva yield\n");
     gt_run();
-    printf("main: kraj\n");
+    printf("main: obe gotove\n");
     return 0;
 }

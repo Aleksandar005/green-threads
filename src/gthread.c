@@ -30,20 +30,24 @@ static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 static gt_thread_t *gt_all_head;
 
+static volatile sig_atomic_t gt_preempt_off = 1; // kad je 1, preempcija zabranjena
+
 void gt_yield(void) {
-    gt_thread_t *self = gt_current;
-    self->state = GT_READY;
-    swapcontext(&self->ctx, &gt_sched_ctx);
+    gt_preempt_off = 1;
+    gt_current->state = GT_READY;
+    swapcontext(&gt_current->ctx, &gt_sched_ctx);
+    gt_preempt_off = 0;
 }
 
 void gt_join(gt_thread_t *t) {
-    if (t->state == GT_FINISHED){
-        return;
+    gt_preempt_off = 1;
+    if (t->state != GT_FINISHED){
+        gt_thread_t *self = gt_current;
+        t->joiner = self;
+        self->state = GT_BLOCKED;
+        swapcontext(&self->ctx, &gt_sched_ctx);
     }
-    gt_thread_t *self = gt_current;
-    t->joiner = self;
-    self->state = GT_BLOCKED;
-    swapcontext(&self->ctx, &gt_sched_ctx);
+    gt_preempt_off = 0;
 }
 
 static void gt_free_all(void) {
@@ -83,15 +87,20 @@ static gt_thread_t *gt_ready_pop(void){
 
 static void gt_tick(int sig){
     (void)sig;
-    ssize_t n = write(STDOUT_FILENO, ".", 1);
-    (void)n;
+    if(gt_preempt_off){
+        return;
+    }
+    gt_preempt_off = 1;
+    gt_current->state = GT_READY;
+    swapcontext(&gt_current->ctx, &gt_sched_ctx);
+    gt_preempt_off = 0;
 }
 
 static void gt_timer_start(void){
     struct sigaction sa;
     sa.sa_handler = gt_tick;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
+    sa.sa_flags = SA_RESTART | SA_NODEFER;
     sigaction(SIGALRM, &sa, NULL);
 
     struct itimerval tv;
@@ -113,6 +122,7 @@ static void gt_timer_stop(void){
 
 void gt_run(void){
     gt_timer_start();
+    gt_preempt_off = 1;
     gt_thread_t *t;
     while((t = gt_ready_pop()) != NULL){
         gt_current = t;
@@ -133,7 +143,9 @@ void gt_run(void){
 
 static void gt_trampoline(void) {
     gt_thread_t *self = gt_current;
+    gt_preempt_off = 0;
     self->fn(self->arg);
+    gt_preempt_off = 1;
     self->state = GT_FINISHED;
 }
 
@@ -162,9 +174,12 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->ctx.uc_link = &gt_sched_ctx; // gde se ide kad nit zavrsi
     makecontext(&t->ctx, gt_trampoline, 0);
 
+    gt_preempt_off = 1;
+    t->id = gt_next_id++;
     t->all_next = gt_all_head;
     gt_all_head = t;
-
     gt_ready_push(t);
+    gt_preempt_off = 0;
+
     return t;
 }

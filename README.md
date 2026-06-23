@@ -13,6 +13,6 @@ timer-based preemption. Built and tested on Linux.
 - [x] Thread control block + spawn
 - [x] Cooperative scheduler (yield)
 - [x] Thread lifecycle (join, cleanup)
-- [ ] Preemption (timer + signal)
+- [x] Preemption (timer + signal)
 - [ ] Mutex
 - [ ] Port to xv6
