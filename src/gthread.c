@@ -183,3 +183,48 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
 
     return t;
 }
+
+void gt_mutex_init(gt_mutex_t *m) {
+    m->locked = 0;
+    m->wait_head = NULL;
+    m->wait_tail = NULL;
+}
+
+void gt_mutex_lock(gt_mutex_t *m){
+    gt_preempt_off = 1;
+    if(!m->locked){
+        m->locked = 1;
+        gt_preempt_off = 0;
+        return;
+    }
+
+    gt_thread_t *self = gt_current;
+    self->next = NULL;
+    if(m->wait_tail){
+        m->wait_tail->next = self;
+    } else {
+        m->wait_head = self;
+    }
+
+    m->wait_tail = self;
+    self->state = GT_BLOCKED;
+    swapcontext(&self->ctx, &gt_sched_ctx);
+    gt_preempt_off = 0;
+}
+
+void gt_mutex_unlock(gt_mutex_t *m) {
+    gt_preempt_off = 1;
+    if (m->wait_head) {
+        gt_thread_t *t = m->wait_head;
+        m->wait_head = t->next;
+        if (!m->wait_head){
+            m->wait_tail = NULL;
+        }
+
+        t->state = GT_READY;
+        gt_ready_push(t);
+    } else {
+        m->locked = 0;
+    }
+    gt_preempt_off = 0;
+}
