@@ -1,9 +1,14 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -g -Iinclude
+CFLAGS  = -Wall -Wextra -g -Iinclude -D_XOPEN_SOURCE=600
 SRC     = $(wildcard src/*.c)
 OBJ     = $(SRC:.c=.o)
 EXAMPLES = $(wildcard examples/*.c)
 BINS     = $(EXAMPLES:examples/%.c=build/%)
+
+UNAME := $(shell uname -s)
+ifeq ($(UNAME),Darwin)
+CFLAGS += -Wno-deprecated-declarations
+endif
 
 all: $(BINS)
 
