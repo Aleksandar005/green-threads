@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -g -Iinclude -D_XOPEN_SOURCE=600
+CFLAGS  = -Wall -Wextra -g -Iinclude -D_XOPEN_SOURCE=600 -pthread
 SRC     = $(wildcard src/*.c)
 OBJ     = $(SRC:.c=.o)
 EXAMPLES = $(wildcard examples/*.c)
