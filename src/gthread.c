@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <stdatomic.h>
 
 #define GT_STACK_SIZE (64 * 1024)
 #define GT_TIME_SLICE_US  50000
@@ -22,15 +23,36 @@ struct gt_thread {
     gt_thread_t *all_next; // veza u listi svih niti
 };
 
-static ucontext_t  gt_sched_ctx;
-static gt_thread_t *gt_current;
+// ove tri su po workeru tj. svaka OS nit ima svoju kopiju
+static _Thread_local ucontext_t  gt_sched_ctx;
+static _Thread_local gt_thread_t *gt_current;
+static _Thread_local volatile sig_atomic_t gt_preempt_off = 1; // kad je 1, preempcija zabranjena
+
 static int gt_next_id = 1;
 
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 static gt_thread_t *gt_all_head;
 
-static volatile sig_atomic_t gt_preempt_off = 1; // kad je 1, preempcija zabranjena
+// spinlock koji dok je zauzet, vrtimo se u petlji
+typedef struct {
+    atomic_flag zauzet;
+} gt_spinlock_t;
+
+static void gt_spin_lock(gt_spinlock_t *l){
+    while(atomic_flag_test_and_set(&l->zauzet)){
+        // neko drugi drzi bravu
+    }
+}
+
+static void gt_spin_unlock(gt_spinlock_t *l){
+    atomic_flag_clear(&l->zauzet);
+}
+
+// ovo da se zaztite gt_ready_head i gt_ready_tail
+static gt_spinlock_t gt_ready_lock = {ATOMIC_FLAG_INIT};
+// stiti gt_all_head i gt_next_id
+static gt_spinlock_t gt_all_lock = {ATOMIC_FLAG_INIT};
 
 void gt_yield(void) {
     gt_preempt_off = 1;
@@ -63,6 +85,8 @@ static void gt_free_all(void) {
 
 
 static void gt_ready_push(gt_thread_t *t){
+    gt_spin_lock(&gt_ready_lock);
+
     t->next = NULL;
     if (gt_ready_tail){
         gt_ready_tail->next = t;
@@ -71,9 +95,13 @@ static void gt_ready_push(gt_thread_t *t){
         gt_ready_head = t;
     }
     gt_ready_tail = t;
+
+    gt_spin_unlock(&gt_ready_lock);
 }
 
 static gt_thread_t *gt_ready_pop(void){
+    gt_spin_lock(&gt_ready_lock);
+
     gt_thread_t *t = gt_ready_head;
     if(t){
         gt_ready_head = t->next;
@@ -82,6 +110,7 @@ static gt_thread_t *gt_ready_pop(void){
         }
     }
 
+    gt_spin_unlock(&gt_ready_lock);
     return t;
 }
 
@@ -165,7 +194,6 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->fn = fn;
     t->arg = arg;
     t->state = GT_READY;
-    t->id = gt_next_id++;
     t->joiner = NULL;
 
     getcontext(&t->ctx);
@@ -175,9 +203,13 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     makecontext(&t->ctx, gt_trampoline, 0);
 
     gt_preempt_off = 1;
+
+    gt_spin_lock(&gt_all_lock);
     t->id = gt_next_id++;
     t->all_next = gt_all_head;
     gt_all_head = t;
+    gt_spin_unlock(&gt_all_lock);
+
     gt_ready_push(t);
     gt_preempt_off = 0;
 
