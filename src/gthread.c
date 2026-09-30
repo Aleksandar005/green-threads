@@ -20,7 +20,9 @@ struct gt_thread {
     int id; // redni broj
     gt_thread_t *next; // veza u redu spremnih
     gt_thread_t *joiner; // nit koja ceka da ova zavrsi
+    gt_spinlock_t join_lock; // stiti prelazak u GT_FINISHED i polje joiner
     gt_thread_t *all_next; // veza u listi svih niti
+    gt_spinlock_t *release_after_switch; // brava koju scheduler otpusta kad sacuva nas context
 };
 
 // ove tri su po workeru tj. svaka OS nit ima svoju kopiju
@@ -33,11 +35,6 @@ static int gt_next_id = 1;
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 static gt_thread_t *gt_all_head;
-
-// spinlock koji dok je zauzet, vrtimo se u petlji
-typedef struct {
-    atomic_flag zauzet;
-} gt_spinlock_t;
 
 static void gt_spin_lock(gt_spinlock_t *l){
     while(atomic_flag_test_and_set(&l->zauzet)){
@@ -63,12 +60,21 @@ void gt_yield(void) {
 
 void gt_join(gt_thread_t *t) {
     gt_preempt_off = 1;
-    if (t->state != GT_FINISHED){
-        gt_thread_t *self = gt_current;
-        t->joiner = self;
-        self->state = GT_BLOCKED;
-        swapcontext(&self->ctx, &gt_sched_ctx);
+    gt_spin_lock(&t->join_lock);
+
+    if(t->state == GT_FINISHED){
+        // vec je gotova, nema sta da se ceka
+        gt_spin_unlock(&t->join_lock);
+        gt_preempt_off = 0;
+        return;
     }
+
+    gt_thread_t *self = gt_current;
+    t->joiner = self;
+    self->state = GT_BLOCKED;
+
+    self->release_after_switch = &t->join_lock;
+    swapcontext(&self->ctx, &gt_sched_ctx);
     gt_preempt_off = 0;
 }
 
@@ -164,6 +170,13 @@ void gt_run(void){
             t->joiner->state = GT_READY;
             gt_ready_push(t->joiner);
         }
+
+        // context niti je sad sacuvan, otpustamo bravu
+        gt_spinlock_t *brava = t->release_after_switch;
+        if(brava){
+            t->release_after_switch = NULL;
+            gt_spin_unlock(brava);
+        }
     }
 
     gt_timer_stop();
@@ -175,7 +188,16 @@ static void gt_trampoline(void) {
     gt_preempt_off = 0;
     self->fn(self->arg);
     gt_preempt_off = 1;
+    
+    // oznaka kraja mora ici pod istom bravom kojom gt_join proverava stanje
+    gt_spin_lock(&self->join_lock);
     self->state = GT_FINISHED;
+
+    // scheduler prvo cita joinera pa onda otpusta bravu
+    self->release_after_switch = &self->join_lock;
+
+    // skacemo u scheduler worker na kom se sad izvrsava
+    setcontext(&gt_sched_ctx);
 }
 
 
@@ -195,11 +217,13 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->arg = arg;
     t->state = GT_READY;
     t->joiner = NULL;
+    t->release_after_switch = NULL;
+    atomic_flag_clear(&t->join_lock.zauzet);
 
     getcontext(&t->ctx);
     t->ctx.uc_stack.ss_sp = t->stack;
     t->ctx.uc_stack.ss_size = GT_STACK_SIZE;
-    t->ctx.uc_link = &gt_sched_ctx; // gde se ide kad nit zavrsi
+    t->ctx.uc_link = NULL; // trampolina se nikad ne vraca, sama skace u scheduler
     makecontext(&t->ctx, gt_trampoline, 0);
 
     gt_preempt_off = 1;
@@ -217,6 +241,7 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
 }
 
 void gt_mutex_init(gt_mutex_t *m) {
+    atomic_flag_clear(&m->guard.zauzet);
     m->locked = 0;
     m->wait_head = NULL;
     m->wait_tail = NULL;
@@ -224,8 +249,11 @@ void gt_mutex_init(gt_mutex_t *m) {
 
 void gt_mutex_lock(gt_mutex_t *m){
     gt_preempt_off = 1;
+    gt_spin_lock(&m->guard);
+
     if(!m->locked){
         m->locked = 1;
+        gt_spin_unlock(&m->guard);
         gt_preempt_off = 0;
         return;
     }
@@ -240,23 +268,32 @@ void gt_mutex_lock(gt_mutex_t *m){
 
     m->wait_tail = self;
     self->state = GT_BLOCKED;
+    // guard se ne otpusta ovde, jer ce ga scheduler otpustiti kasnije nakon cuvanja konteksta
+    self->release_after_switch = &m->guard;
     swapcontext(&self->ctx, &gt_sched_ctx);
     gt_preempt_off = 0;
 }
 
 void gt_mutex_unlock(gt_mutex_t *m) {
     gt_preempt_off = 1;
-    if (m->wait_head) {
-        gt_thread_t *t = m->wait_head;
+    gt_spin_lock(&m->guard);
+
+    gt_thread_t *t = m->wait_head;
+    if (t) {
         m->wait_head = t->next;
         if (!m->wait_head){
             m->wait_tail = NULL;
         }
-
-        t->state = GT_READY;
-        gt_ready_push(t);
     } else {
         m->locked = 0;
     }
+
+    gt_spin_unlock(&m->guard);
+
+    if(t){
+        t->state = GT_READY;
+        gt_ready_push(t);
+    }
+
     gt_preempt_off = 0;
 }
