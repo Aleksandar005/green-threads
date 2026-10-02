@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <stdatomic.h>
+#include <pthread.h>
+#include <sched.h>
 
 #define GT_STACK_SIZE (64 * 1024)
 #define GT_TIME_SLICE_US  50000
@@ -35,6 +37,7 @@ static int gt_next_id = 1;
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 static gt_thread_t *gt_all_head;
+static atomic_int gt_live = 0; // broj niti koje su napravljene a jos nisu zavresene
 
 static void gt_spin_lock(gt_spinlock_t *l){
     while(atomic_flag_test_and_set(&l->zauzet)){
@@ -155,11 +158,18 @@ static void gt_timer_stop(void){
     setitimer(ITIMER_REAL, &tv, NULL);
 }
 
-void gt_run(void){
-    gt_timer_start();
+// petlja koju vrti svaki worker
+static void gt_shceduler_loop(void){
     gt_preempt_off = 1;
-    gt_thread_t *t;
-    while((t = gt_ready_pop()) != NULL){
+
+    while(atomic_load(&gt_live) > 0){
+        gt_thread_t *t = gt_ready_pop();
+        if(!t){
+            // red je prazank, ali neke niti rade na drugim workerima
+            sched_yield();
+            continue;
+        }
+
         gt_current = t;
         t->state = GT_RUNNING;
         swapcontext(&gt_sched_ctx, &t->ctx);
@@ -171,16 +181,55 @@ void gt_run(void){
             gt_ready_push(t->joiner);
         }
 
-        // context niti je sad sacuvan, otpustamo bravu
+        // context niti je sad sacuvan
         gt_spinlock_t *brava = t->release_after_switch;
         if(brava){
             t->release_after_switch = NULL;
             gt_spin_unlock(brava);
         }
+
+        if(t->state == GT_FINISHED){
+            atomic_fetch_sub(&gt_live, 1);
+        }
+    }
+    
+}
+
+// pocetna funkcija za dodatne workere
+static void *gt_worker_main(void *arg){
+    (void)arg;
+    gt_shceduler_loop();
+    return NULL;
+}
+
+void gt_run_workers(int broj_workera){
+    pthread_t niti[broj_workera];
+
+    // preepcija za sad samo sa jednim workerom
+    if(broj_workera == 1){
+        gt_timer_start();
     }
 
-    gt_timer_stop();
+    // main je worker 0, ostale pravimo
+    for(int i = 1; i < broj_workera; i++){
+        pthread_create(&niti[i], NULL, gt_worker_main, NULL);
+    }
+
+    gt_shceduler_loop();
+
+    for(int i = 1; i < broj_workera; i++){
+        pthread_join(niti[i], NULL);
+    }
+
+    if(broj_workera == 1){
+        gt_timer_stop();
+    }
+
     gt_free_all();
+}
+
+void gt_run(void){
+    gt_run_workers(1);
 }
 
 static void gt_trampoline(void) {
@@ -234,6 +283,7 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     gt_all_head = t;
     gt_spin_unlock(&gt_all_lock);
 
+    atomic_fetch_add(&gt_live, 1);
     gt_ready_push(t);
     gt_preempt_off = 0;
 
