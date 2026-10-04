@@ -237,25 +237,29 @@ static void gt_scheduler_loop(void){
         t->prekinuta = 0;
         swapcontext(&gt_sched_ctx, &t->ctx);
 
-        if(t->state == GT_READY){
+        // stanje citamo jednom, odmah cim nit vratimo u red ili otpustimo bravu
+        // drugi worker moze da je pokrene i promeni joj stanje
+        enum gt_state stanje = t->state;
+        gt_spinlock_t *brava = t->release_after_switch;
+        t->release_after_switch = NULL;
+
+        if(stanje == GT_READY){
             if(t->prekinuta){
                 gt_local_push(t);
             } else {
                 gt_ready_push(t);
             }
-        } else if(t->state == GT_FINISHED && t->joiner){
+        } else if(stanje == GT_FINISHED && t->joiner){
             t->joiner->state = GT_READY;
             gt_ready_push(t->joiner);
         }
 
-        // context niti je sad sacuvan
-        gt_spinlock_t *brava = t->release_after_switch;
+        // context niti je sad sacuvan, otpustamo bravu
         if(brava){
-            t->release_after_switch = NULL;
             gt_spin_unlock(brava);
         }
 
-        if(t->state == GT_FINISHED){
+        if(stanje == GT_FINISHED){
             atomic_fetch_sub(&gt_live, 1);
         }
     }
@@ -282,16 +286,22 @@ void gt_run_workers(int broj_workera){
     gt_preempt_off = 1;
 
     gt_broj_workera = broj_workera;
-    gt_workers[0] = pthread_self(); // main je worker 0
-    for(int i = 1; i < broj_workera; i++){
+
+    // main nije worker, svi workeri su posebne pthread niti
+    for(int i = 0; i < broj_workera; i++){
         pthread_create(&gt_workers[i], NULL, gt_worker_main, NULL);
     }
 
     gt_preempt_start();
-    gt_scheduler_loop();
-    gt_preempt_stop();
 
-    for(int i = 1; i < broj_workera; i++){
+    // main samo ceka da sve lake niti zavrse
+    while(atomic_load(&gt_live) > 0){
+        usleep(1000);
+    }
+
+    gt_preempt_stop(); // ticker gasimo pre join-a, kao i pre
+
+    for(int i = 0; i < broj_workera; i++){
         pthread_join(gt_workers[i], NULL);
     }
 
