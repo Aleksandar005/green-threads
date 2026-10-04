@@ -10,6 +10,7 @@
 
 #define GT_STACK_SIZE (64 * 1024)
 #define GT_TIME_SLICE_US  50000
+#define GT_MAX_WORKERS 64
 
 enum gt_state {GT_READY, GT_RUNNING, GT_FINISHED, GT_BLOCKED};
 
@@ -25,6 +26,7 @@ struct gt_thread {
     gt_spinlock_t join_lock; // stiti prelazak u GT_FINISHED i polje joiner
     gt_thread_t *all_next; // veza u listi svih niti
     gt_spinlock_t *release_after_switch; // brava koju scheduler otpusta kad sacuva nas context
+    int prekinuta; // 1 ako ju je prekinuo signal, pa mora da nastavi na istom workeru
 };
 
 // ove tri su po workeru tj. svaka OS nit ima svoju kopiju
@@ -32,12 +34,24 @@ static _Thread_local ucontext_t  gt_sched_ctx;
 static _Thread_local gt_thread_t *gt_current;
 static _Thread_local volatile sig_atomic_t gt_preempt_off = 1; // kad je 1, preempcija zabranjena
 
+// lokalni red workera, niti koje je ovaj worker prekinuo signalom
+static _Thread_local gt_thread_t *gt_local_head;
+static _Thread_local gt_thread_t *gt_local_tail;
+static _Thread_local int gt_prvo_lokalni; // prekidac za naizmenicno biranje reda
+
+
 static int gt_next_id = 1;
 
 static gt_thread_t *gt_ready_head;
 static gt_thread_t *gt_ready_tail;
 static gt_thread_t *gt_all_head;
 static atomic_int gt_live = 0; // broj niti koje su napravljene a jos nisu zavresene
+
+static pthread_t gt_workers[GT_MAX_WORKERS]; // svaki worker, da bi ticker znao kome salje signal
+static int gt_broj_workera;
+
+static pthread_t gt_ticker; // nit koja salje SIGALRM workerima
+static atomic_int gt_ticker_radi; // kad je 0, ticker zavrsva
 
 static void gt_spin_lock(gt_spinlock_t *l){
     while(atomic_flag_test_and_set(&l->zauzet)){
@@ -130,40 +144,88 @@ static void gt_tick(int sig){
     }
     gt_preempt_off = 1;
     gt_current->state = GT_READY;
+    gt_current->prekinuta = 1;
     swapcontext(&gt_current->ctx, &gt_sched_ctx);
     gt_preempt_off = 0;
 }
 
-static void gt_timer_start(void){
+// ticker na svakih GT_TIME_SLICE_US posalje SIGALRM svakom workeru posebno
+static void *gt_ticker_main(void *arg){
+    (void)arg;
+    while(atomic_load(&gt_ticker_radi)){
+        usleep(GT_TIME_SLICE_US);
+        for(int i = 0; i < gt_broj_workera; i++){
+            pthread_kill(gt_workers[i], SIGALRM);
+        }
+    }
+
+    return NULL;
+}
+
+static void gt_preempt_start(void){
     struct sigaction sa;
     sa.sa_handler = gt_tick;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART | SA_NODEFER;
     sigaction(SIGALRM, &sa, NULL);
 
-    struct itimerval tv;
-    tv.it_value.tv_sec = 0;
-    tv.it_value.tv_usec = GT_TIME_SLICE_US;
-    tv.it_interval.tv_sec = 0;
-    tv.it_interval.tv_usec = GT_TIME_SLICE_US;
-    setitimer(ITIMER_REAL, &tv, NULL);
+    atomic_store(&gt_ticker_radi, 1);
+    pthread_create(&gt_ticker, NULL, gt_ticker_main, NULL);
 }
 
-static void gt_timer_stop(void){
-    struct itimerval tv;
-    tv.it_value.tv_sec     = 0;
-    tv.it_value.tv_usec    = 0;
-    tv.it_interval.tv_sec  = 0;
-    tv.it_interval.tv_usec = 0;
-    setitimer(ITIMER_REAL, &tv, NULL);
+static void gt_preempt_stop(void){
+    atomic_store(&gt_ticker_radi, 0);
+    pthread_join(gt_ticker, NULL);
+}
+
+static void gt_local_push(gt_thread_t *t){
+    t->next = NULL;
+    if(gt_local_tail){
+        gt_local_tail->next = t;
+    } else {
+        gt_local_head = t;
+    }
+    gt_local_tail = t;
+}
+
+static gt_thread_t *gt_local_pop(void){
+    gt_thread_t *t = gt_local_head;
+    if(t){
+        gt_local_head = t->next;
+        if(!gt_local_head){
+            gt_local_tail = NULL;
+        }
+    }
+
+    return t;
+}
+
+// bira sledecu nit, naizmenicno prvo iz lokalnog pa iz zajednickog reda
+static gt_thread_t *gt_next_thread(void){
+    gt_thread_t *t;
+    gt_prvo_lokalni = !gt_prvo_lokalni;
+
+    if(gt_prvo_lokalni){
+        t = gt_local_pop();
+        if(!t){
+            t = gt_ready_pop();
+        }
+    } else {
+        t = gt_ready_pop();
+        if(!t){
+            t = gt_local_pop();
+        }
+    }
+
+    return t;
 }
 
 // petlja koju vrti svaki worker
-static void gt_shceduler_loop(void){
+static void gt_scheduler_loop(void){
     gt_preempt_off = 1;
 
     while(atomic_load(&gt_live) > 0){
-        gt_thread_t *t = gt_ready_pop();
+        gt_thread_t *t = gt_next_thread();
         if(!t){
             // red je prazank, ali neke niti rade na drugim workerima
             sched_yield();
@@ -172,10 +234,15 @@ static void gt_shceduler_loop(void){
 
         gt_current = t;
         t->state = GT_RUNNING;
+        t->prekinuta = 0;
         swapcontext(&gt_sched_ctx, &t->ctx);
 
         if(t->state == GT_READY){
-            gt_ready_push(t);
+            if(t->prekinuta){
+                gt_local_push(t);
+            } else {
+                gt_ready_push(t);
+            }
         } else if(t->state == GT_FINISHED && t->joiner){
             t->joiner->state = GT_READY;
             gt_ready_push(t->joiner);
@@ -198,31 +265,34 @@ static void gt_shceduler_loop(void){
 // pocetna funkcija za dodatne workere
 static void *gt_worker_main(void *arg){
     (void)arg;
-    gt_shceduler_loop();
+    gt_scheduler_loop();
     return NULL;
 }
 
 void gt_run_workers(int broj_workera){
-    pthread_t niti[broj_workera];
-
-    // preepcija za sad samo sa jednim workerom
-    if(broj_workera == 1){
-        gt_timer_start();
+    if(broj_workera < 1){
+        broj_workera = 1;
     }
 
-    // main je worker 0, ostale pravimo
+    if(broj_workera > GT_MAX_WORKERS){
+        broj_workera = GT_MAX_WORKERS;
+    }
+
+    // main nije laka nit, pa signal ne sme da je prekine
+    gt_preempt_off = 1;
+
+    gt_broj_workera = broj_workera;
+    gt_workers[0] = pthread_self(); // main je worker 0
     for(int i = 1; i < broj_workera; i++){
-        pthread_create(&niti[i], NULL, gt_worker_main, NULL);
+        pthread_create(&gt_workers[i], NULL, gt_worker_main, NULL);
     }
 
-    gt_shceduler_loop();
+    gt_preempt_start();
+    gt_scheduler_loop();
+    gt_preempt_stop();
 
     for(int i = 1; i < broj_workera; i++){
-        pthread_join(niti[i], NULL);
-    }
-
-    if(broj_workera == 1){
-        gt_timer_stop();
+        pthread_join(gt_workers[i], NULL);
     }
 
     gt_free_all();
@@ -267,6 +337,7 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->state = GT_READY;
     t->joiner = NULL;
     t->release_after_switch = NULL;
+    t->prekinuta = 0;
     atomic_flag_clear(&t->join_lock.zauzet);
 
     getcontext(&t->ctx);

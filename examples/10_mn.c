@@ -11,11 +11,6 @@ static void racunaj(void *arg){
 
     for(int i = 0; i < KORACI; i++){
         suma += i;
-        // dok preepcija ne radi sa vise workera, prepustamo rucno
-        if(i % 1000000 == 0){
-            gt_yield();
-        }
-        
     }
 
     printf("nit %ld: gotova (suma = %ld)\n", id, suma);
