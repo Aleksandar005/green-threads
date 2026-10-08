@@ -11,6 +11,13 @@ void gt_join(gt_thread_t *t);
 void gt_run(void);
 void gt_run_workers(int broj_workera);
 
+// zabrana preempcije oko koda koji nije bezbedam za prekid (printf, malloc, ...)
+void gt_preempt_disable(void);
+void gt_preempt_enable(void);
+
+// isto kao printf, ali tajmer ne moze da prekine nit usred ispisa
+int gt_printf(const char *fmt, ...);
+
 // unutrasnji spinlock biblioteke, korisnik ga ne koristi direktno
 typedef struct {
     atomic_flag zauzet;

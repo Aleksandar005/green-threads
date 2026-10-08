@@ -7,6 +7,8 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdio.h>
+#include <stdarg.h>
 
 #define GT_STACK_SIZE (64 * 1024)
 #define GT_TIME_SLICE_US  50000
@@ -39,6 +41,20 @@ static _Thread_local gt_thread_t *gt_local_head;
 static _Thread_local gt_thread_t *gt_local_tail;
 static _Thread_local int gt_prvo_lokalni; // prekidac za naizmenicno biranje reda
 
+// Adresu thread-local promenljive ne smemo da izracunamo pre prebacivanja i koristimo posle,
+// jer nit posle swapcontext moze da radi na drugom workeru. Kompajler na macOS to radi
+// unutar jedne fje, pa pristup ide kroz funkcije koje se ne ugradjuju
+__attribute__((noinline)) static void gt_set_preempt_off(int v){
+    gt_preempt_off = v;
+}
+
+__attribute__((noinline)) static int gt_get_preempt_off(void){
+    return gt_preempt_off;
+}
+
+__attribute__((noinline)) static ucontext_t *gt_get_sched_ctx(void){
+    return &gt_sched_ctx;
+}
 
 static int gt_next_id = 1;
 
@@ -69,20 +85,20 @@ static gt_spinlock_t gt_ready_lock = {ATOMIC_FLAG_INIT};
 static gt_spinlock_t gt_all_lock = {ATOMIC_FLAG_INIT};
 
 void gt_yield(void) {
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     gt_current->state = GT_READY;
     swapcontext(&gt_current->ctx, &gt_sched_ctx);
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
 }
 
 void gt_join(gt_thread_t *t) {
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     gt_spin_lock(&t->join_lock);
 
     if(t->state == GT_FINISHED){
         // vec je gotova, nema sta da se ceka
         gt_spin_unlock(&t->join_lock);
-        gt_preempt_off = 0;
+        gt_set_preempt_off(0);
         return;
     }
 
@@ -92,7 +108,7 @@ void gt_join(gt_thread_t *t) {
 
     self->release_after_switch = &t->join_lock;
     swapcontext(&self->ctx, &gt_sched_ctx);
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
 }
 
 static void gt_free_all(void) {
@@ -139,14 +155,14 @@ static gt_thread_t *gt_ready_pop(void){
 
 static void gt_tick(int sig){
     (void)sig;
-    if(gt_preempt_off){
+    if(gt_get_preempt_off()){
         return;
     }
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     gt_current->state = GT_READY;
     gt_current->prekinuta = 1;
     swapcontext(&gt_current->ctx, &gt_sched_ctx);
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
 }
 
 // ticker na svakih GT_TIME_SLICE_US posalje SIGALRM svakom workeru posebno
@@ -222,7 +238,7 @@ static gt_thread_t *gt_next_thread(void){
 
 // petlja koju vrti svaki worker
 static void gt_scheduler_loop(void){
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
 
     while(atomic_load(&gt_live) > 0){
         gt_thread_t *t = gt_next_thread();
@@ -283,7 +299,7 @@ void gt_run_workers(int broj_workera){
     }
 
     // main nije laka nit, pa signal ne sme da je prekine
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
 
     gt_broj_workera = broj_workera;
 
@@ -314,9 +330,9 @@ void gt_run(void){
 
 static void gt_trampoline(void) {
     gt_thread_t *self = gt_current;
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
     self->fn(self->arg);
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     
     // oznaka kraja mora ici pod istom bravom kojom gt_join proverava stanje
     gt_spin_lock(&self->join_lock);
@@ -326,11 +342,14 @@ static void gt_trampoline(void) {
     self->release_after_switch = &self->join_lock;
 
     // skacemo u scheduler worker na kom se sad izvrsava
-    setcontext(&gt_sched_ctx);
+    setcontext(gt_get_sched_ctx());
 }
 
 
 gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
+    // malloc ne sme biti prekinut, pa zabranu ukljucujemo odmah
+    gt_set_preempt_off(1);
+    
     gt_thread_t *t = malloc(sizeof(*t));
     if(!t){
         return NULL;
@@ -356,7 +375,7 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
     t->ctx.uc_link = NULL; // trampolina se nikad ne vraca, sama skace u scheduler
     makecontext(&t->ctx, gt_trampoline, 0);
 
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
 
     gt_spin_lock(&gt_all_lock);
     t->id = gt_next_id++;
@@ -366,7 +385,7 @@ gt_thread_t *gt_spawn(void (*fn)(void *), void *arg){
 
     atomic_fetch_add(&gt_live, 1);
     gt_ready_push(t);
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
 
     return t;
 }
@@ -379,13 +398,13 @@ void gt_mutex_init(gt_mutex_t *m) {
 }
 
 void gt_mutex_lock(gt_mutex_t *m){
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     gt_spin_lock(&m->guard);
 
     if(!m->locked){
         m->locked = 1;
         gt_spin_unlock(&m->guard);
-        gt_preempt_off = 0;
+        gt_set_preempt_off(0);
         return;
     }
 
@@ -402,11 +421,11 @@ void gt_mutex_lock(gt_mutex_t *m){
     // guard se ne otpusta ovde, jer ce ga scheduler otpustiti kasnije nakon cuvanja konteksta
     self->release_after_switch = &m->guard;
     swapcontext(&self->ctx, &gt_sched_ctx);
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
 }
 
 void gt_mutex_unlock(gt_mutex_t *m) {
-    gt_preempt_off = 1;
+    gt_set_preempt_off(1);
     gt_spin_lock(&m->guard);
 
     gt_thread_t *t = m->wait_head;
@@ -426,5 +445,26 @@ void gt_mutex_unlock(gt_mutex_t *m) {
         gt_ready_push(t);
     }
 
-    gt_preempt_off = 0;
+    gt_set_preempt_off(0);
+}
+
+void gt_preempt_disable(void){
+    gt_set_preempt_off(1);
+}
+
+void gt_preempt_enable(void){
+    gt_set_preempt_off(0);
+}
+
+int gt_printf(const char *fmt, ...){
+    va_list args;
+    va_start(args, fmt);
+
+    gt_preempt_disable();
+    int n = vprintf(fmt, args);
+    gt_preempt_enable();
+
+    va_end(args);
+
+    return n;
 }
